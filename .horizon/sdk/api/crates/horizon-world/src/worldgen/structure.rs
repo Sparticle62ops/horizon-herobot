@@ -1,0 +1,524 @@
+//! Structure templates, processors and placement shared by template features
+//! and structure pieces.
+pub mod end_city;
+pub mod enhanced_terrain;
+pub mod features;
+pub mod formations;
+pub mod fortress;
+pub mod jigsaw;
+pub mod legacy;
+pub mod mansion;
+pub mod mineshaft;
+pub mod mod_types;
+pub mod monument;
+pub mod nether_fossil;
+pub mod ocean_ruin;
+pub mod piece_limited;
+pub mod processor;
+pub mod ruined_portal;
+pub(crate) mod saved_legacy;
+pub(crate) mod saved_templates;
+pub mod simple;
+pub mod start;
+pub mod start_checks;
+pub mod stronghold;
+pub mod template;
+pub mod temple;
+
+use horizon_core::geometry::Direction;
+use processor::ProcessorList;
+use std::{
+    collections::{BTreeMap, BTreeSet, HashMap},
+    io::Read,
+    path::{Path, PathBuf},
+    sync::{Arc, OnceLock, RwLock},
+};
+pub mod block_entity_transform;
+
+pub use template::{BlockInfo, EntityInfo, JigsawInfo, StructureTemplate, save_nbt};
+use {
+    crate::registry::{BlockRegistry, BlockStateId},
+    horizon_core::nbt::Limits,
+};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Rotation {
+    None,
+    Clockwise90,
+    Clockwise180,
+    Counterclockwise90,
+}
+impl Rotation {
+    pub const ALL: [Self; 4] = [
+        Self::None,
+        Self::Clockwise90,
+        Self::Clockwise180,
+        Self::Counterclockwise90,
+    ];
+    pub fn from_name(name: &str) -> Option<Self> {
+        Some(match name {
+            "none" => Self::None,
+            "clockwise_90" => Self::Clockwise90,
+            "180" => Self::Clockwise180,
+            "counterclockwise_90" => Self::Counterclockwise90,
+            _ => return None,
+        })
+    }
+    /// Rotation.getRandom: one bounded draw over the four values.
+    pub fn random(random: &mut impl horizon_core::random::RandomSource) -> Self {
+        Self::ALL[random.next_int_bound(4).unwrap_or(0) as usize]
+    }
+    pub fn rotate_direction(self, direction: Direction) -> Direction {
+        if matches!(direction, Direction::Up | Direction::Down) {
+            return direction;
+        }
+        let order = [
+            Direction::North,
+            Direction::East,
+            Direction::South,
+            Direction::West,
+        ];
+        let index = order.iter().position(|d| *d == direction).unwrap();
+        order[(index + self as usize) % 4]
+    }
+    /// `Rotation.getSerializedName`: the value of `Rotation.CODEC`.
+    pub fn serialized_name(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Clockwise90 => "clockwise_90",
+            Self::Clockwise180 => "180",
+            Self::Counterclockwise90 => "counterclockwise_90",
+        }
+    }
+    pub fn get_rotated(self, other: Self) -> Self {
+        Self::ALL[(self as usize + other as usize) % 4]
+    }
+    /// `Rotation.name()`, as structure pieces save it.
+    pub fn saved_name(self) -> &'static str {
+        match self {
+            Self::None => "NONE",
+            Self::Clockwise90 => "CLOCKWISE_90",
+            Self::Clockwise180 => "CLOCKWISE_180",
+            Self::Counterclockwise90 => "COUNTERCLOCKWISE_90",
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Mirror {
+    None,
+    LeftRight,
+    FrontBack,
+}
+impl Mirror {
+    /// `Mirror.name()`, as structure pieces save it.
+    pub fn saved_name(self) -> &'static str {
+        match self {
+            Self::None => "NONE",
+            Self::LeftRight => "LEFT_RIGHT",
+            Self::FrontBack => "FRONT_BACK",
+        }
+    }
+}
+
+/// Per-state BlockState.rotate/mirror results and template ordering flags,
+/// exported from vanilla (`blocks/structure-blocks.json`).
+#[derive(Debug, Default)]
+pub struct StateTransforms {
+    rotate: Vec<[u32; 3]>,
+    mirror: Vec<[u32; 2]>,
+    full: Vec<bool>,
+    loot: BTreeSet<BlockStateId>,
+    /// Block entity type of every state that has one (`BlockState.hasBlockEntity`).
+    entity_types: HashMap<BlockStateId, Arc<str>>,
+}
+impl StateTransforms {
+    pub fn from_json(json: &str, states: usize) -> Result<Self, super::DecodeError> {
+        let value: serde_json::Value = serde_json::from_str(json)?;
+        let arr = |key: &'static str| {
+            value[key]
+                .as_array()
+                .cloned()
+                .ok_or(super::DecodeError::Field(key))
+        };
+        let ids = |v: &serde_json::Value| -> Vec<u32> {
+            v.as_array()
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|x| x.as_u64())
+                        .map(|x| x as u32)
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        let rotate = arr("rotate")?
+            .iter()
+            .map(|v| {
+                let v = ids(v);
+                [v[0], v[1], v[2]]
+            })
+            .collect::<Vec<_>>();
+        let mirror = arr("mirror")?
+            .iter()
+            .map(|v| {
+                let v = ids(v);
+                [v[0], v[1]]
+            })
+            .collect::<Vec<_>>();
+        let full = arr("full_block")?
+            .iter()
+            .map(|v| v.as_bool().unwrap_or(false))
+            .collect::<Vec<_>>();
+        if rotate.len() != states || mirror.len() != states || full.len() != states {
+            return Err(super::DecodeError::Field("structure block table size"));
+        }
+        let loot = ids(&value["loot_containers"])
+            .into_iter()
+            .map(BlockStateId)
+            .collect();
+        let mut entity_types = HashMap::new();
+        if let Some(types) = value["block_entities"].as_object() {
+            for (name, states) in types {
+                let name: Arc<str> = Arc::from(name.as_str());
+                for id in ids(states) {
+                    entity_types.insert(BlockStateId(id), name.clone());
+                }
+            }
+        }
+        Ok(Self {
+            rotate,
+            mirror,
+            full,
+            loot,
+            entity_types,
+        })
+    }
+    /// The block entity type a state carries, when it has one.
+    pub fn entity_type(&self, state: BlockStateId) -> Option<&Arc<str>> {
+        self.entity_types.get(&state)
+    }
+    pub fn rotate(&self, state: BlockStateId, rotation: Rotation) -> BlockStateId {
+        match rotation {
+            Rotation::None => state,
+            r => self
+                .rotate
+                .get(state.0 as usize)
+                .map_or(state, |t| BlockStateId(t[r as usize - 1])),
+        }
+    }
+    /// `BlockState.rotate(level, pos, rotation)` as a template places `state`, already
+    /// mirrored, at `pos` (NeoForge's `IBlockExtension.rotate`): this table's turned state, or
+    /// another state of the block its parts answer (`rotate`). Every template placement turns
+    /// its states through here.
+    pub fn rotate_at(
+        &self,
+        state: BlockStateId,
+        pos: [i32; 3],
+        rotation: Rotation,
+    ) -> BlockStateId {
+        crate::native_worldgen_hooks::rotate(state, pos, rotation, self.rotate(state, rotation))
+    }
+    pub fn mirror(&self, state: BlockStateId, mirror: Mirror) -> BlockStateId {
+        match mirror {
+            Mirror::None => state,
+            m => self
+                .mirror
+                .get(state.0 as usize)
+                .map_or(state, |t| BlockStateId(t[m as usize - 1])),
+        }
+    }
+    pub fn full_block(&self, state: BlockStateId) -> bool {
+        self.full.get(state.0 as usize).copied().unwrap_or(false)
+    }
+    pub fn loot_container(&self, state: BlockStateId) -> bool {
+        self.loot.contains(&state)
+    }
+}
+
+fn qualified(id: &str) -> String {
+    if id.contains(':') {
+        id.to_owned()
+    } else {
+        format!("minecraft:{id}")
+    }
+}
+
+/// `dir/<namespace>/<path>.nbt` for a template id, or `None` when the resolved path
+/// leaves `dir`. `Identifier` allows `.` and `/`, so a saved piece's `Template` could
+/// otherwise name `structure/../../.../foo.nbt` and read a file outside the template
+/// root (the prepared-files reader falls back to the disk). Nested paths stay valid.
+fn template_path(dir: &Path, id: &str) -> Option<PathBuf> {
+    let (namespace, path) = id.split_once(':')?;
+    let file = dir.join(namespace).join(format!("{path}.nbt"));
+    for component in file.strip_prefix(dir).ok()?.components() {
+        // A template name never contains a whole `.` or `..` segment; refusing them
+        // keeps the resolved file under the template root even when `dir` itself is
+        // relative.
+        if !matches!(component, std::path::Component::Normal(_)) {
+            return None;
+        }
+    }
+    Some(file)
+}
+
+/// The template files and the ones loaded so far, shared by the resources and
+/// their lazy templates.
+struct TemplateStore {
+    registry: &'static BlockRegistry,
+    transforms: Arc<StateTransforms>,
+    dir: PathBuf,
+    loaded: RwLock<HashMap<String, Arc<StructureTemplate>>>,
+    /// Data packs' template files, which win over the prepared ones.
+    pack_templates: BTreeMap<String, horizon_assets::resource_source::Resource>,
+}
+impl TemplateStore {
+    fn get(&self, id: &str) -> Arc<StructureTemplate> {
+        if let Some(found) = self.loaded.read().unwrap().get(id) {
+            return found.clone();
+        }
+        let bytes = match self.pack_templates.get(id) {
+            Some(resource) => resource.read().ok(),
+            None => template_path(&self.dir, id)
+                .and_then(|file| horizon_core::prepared_files::read(&file).ok()),
+        };
+        let loaded = bytes.and_then(|bytes| {
+            let mut raw = Vec::new();
+            flate2::read::GzDecoder::new(bytes.as_slice())
+                .read_to_end(&mut raw)
+                .ok()?;
+            StructureTemplate::from_bytes(
+                &raw,
+                Limits::templates(),
+                self.registry,
+                &self.transforms,
+            )
+            .ok()
+        });
+        // StructureTemplateManager.getOrCreate: missing templates are empty.
+        let mut loaded = loaded.unwrap_or_else(StructureTemplate::empty);
+        loaded.location = id.into();
+        let loaded = Arc::new(loaded);
+        // Two threads may load the same file: every caller gets the first
+        // one kept, so templates stay comparable by pointer.
+        self.loaded
+            .write()
+            .unwrap()
+            .entry(id.to_owned())
+            .or_insert(loaded)
+            .clone()
+    }
+}
+
+/// A pool element's template, read from its file on first use.
+#[derive(Clone)]
+pub struct LazyTemplate {
+    id: String,
+    store: Option<Arc<TemplateStore>>,
+    cell: OnceLock<Arc<StructureTemplate>>,
+}
+impl LazyTemplate {
+    /// An already loaded template.
+    pub fn loaded(template: Arc<StructureTemplate>) -> Self {
+        Self {
+            id: String::new(),
+            store: None,
+            cell: OnceLock::from(template),
+        }
+    }
+    /// The template (the resources' shared one: comparable by pointer).
+    pub fn arc(&self) -> &Arc<StructureTemplate> {
+        self.cell.get_or_init(|| {
+            self.store
+                .as_ref()
+                .expect("a lazy template has its store")
+                .get(&self.id)
+        })
+    }
+}
+impl std::ops::Deref for LazyTemplate {
+    type Target = StructureTemplate;
+    fn deref(&self) -> &StructureTemplate {
+        self.arc()
+    }
+}
+impl std::fmt::Debug for LazyTemplate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(&**self.arc(), f)
+    }
+}
+
+/// Lazily loaded templates (`structure/<namespace>/<path>.nbt`, gzip NBT) and
+/// processor lists, shared by all generators of one resource bundle.
+pub struct StructureResources {
+    pub registry: &'static BlockRegistry,
+    pub transforms: Arc<StateTransforms>,
+    templates: Arc<TemplateStore>,
+    pub processor_lists: BTreeMap<String, String>,
+    jigsaw_states: BTreeMap<BlockStateId, bool>,
+    pub(crate) waterlogged: HashMap<BlockStateId, BlockStateId>,
+    sources: BTreeSet<BlockStateId>,
+    /// Block names in each block tag, for processors matching tags by block.
+    pub block_tags: BTreeMap<String, BTreeSet<String>>,
+}
+impl std::fmt::Debug for StructureResources {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("StructureResources")
+    }
+}
+impl StructureResources {
+    pub fn new(
+        registry: &'static BlockRegistry,
+        transforms: StateTransforms,
+        dir: &Path,
+        processor_lists: BTreeMap<String, String>,
+        block_tags: &BTreeMap<String, Vec<String>>,
+    ) -> Self {
+        let mut sources = BTreeSet::new();
+        let fluids = crate::fluid::FluidStateTable::new(registry).ok();
+        let mut jigsaw_states = BTreeMap::new();
+        let mut waterlogged = HashMap::new();
+        for id in 0..registry.len() {
+            let id = BlockStateId(id as u32);
+            let state = registry.state(id).unwrap();
+            if state.name == "minecraft:jigsaw" {
+                let orientation = state
+                    .properties
+                    .get("orientation")
+                    .cloned()
+                    .unwrap_or_default();
+                let front = orientation.split('_').next().unwrap_or("");
+                jigsaw_states.insert(id, !matches!(front, "up" | "down"));
+            }
+            if fluids
+                .as_ref()
+                .and_then(|table| table.get(id))
+                .is_some_and(|fluid| fluid.is_source())
+            {
+                sources.insert(id);
+            }
+            // SlabBlock.placeLiquid refuses double slabs.
+            let double_slab = state.name.ends_with("_slab")
+                && state.properties.get("type").map(String::as_str) == Some("double");
+            if !double_slab
+                && state.properties.get("waterlogged").map(String::as_str) == Some("false")
+            {
+                let mut wet = state.clone();
+                wet.properties.insert("waterlogged".into(), "true".into());
+                if let Some(wet) = registry.id(&wet) {
+                    waterlogged.insert(id, wet);
+                }
+            }
+        }
+        let transforms = Arc::new(transforms);
+        Self {
+            registry,
+            transforms: transforms.clone(),
+            templates: Arc::new(TemplateStore {
+                registry,
+                transforms,
+                dir: dir.to_owned(),
+                loaded: RwLock::new(HashMap::new()),
+                pack_templates: BTreeMap::new(),
+            }),
+            processor_lists,
+            jigsaw_states,
+            waterlogged,
+            sources,
+            block_tags: block_tags
+                .iter()
+                .map(|(k, v)| (k.clone(), v.iter().cloned().collect()))
+                .collect(),
+        }
+    }
+    pub fn with_templates(
+        mut self,
+        resources: BTreeMap<String, horizon_assets::resource_source::Resource>,
+    ) -> Self {
+        self.templates = Arc::new(TemplateStore {
+            registry: self.registry,
+            transforms: self.transforms.clone(),
+            dir: self.templates.dir.clone(),
+            loaded: RwLock::new(HashMap::new()),
+            pack_templates: resources,
+        });
+        self
+    }
+    /// In-memory template resources, retaining the same cache invalidation
+    /// as folder and archive sources.
+    pub fn with_pack_templates(self, templates: BTreeMap<String, Arc<[u8]>>) -> Self {
+        self.with_templates(
+            templates
+                .into_iter()
+                .map(|(id, bytes)| {
+                    (
+                        id,
+                        horizon_assets::resource_source::Resource::bytes(bytes.to_vec()),
+                    )
+                })
+                .collect(),
+        )
+    }
+    /// StructureTemplateManager.getOrCreate; missing templates are empty.
+    pub fn template(&self, id: &str) -> Option<Arc<StructureTemplate>> {
+        Some(self.templates.get(&qualified(id)))
+    }
+    /// A template loaded on its first use, as a pool element's
+    /// (StructureTemplateManager.getOrCreate runs when vanilla first touches
+    /// the element, not when its pool is read).
+    pub fn lazy_template(&self, id: &str) -> LazyTemplate {
+        LazyTemplate {
+            id: qualified(id),
+            store: Some(self.templates.clone()),
+            cell: OnceLock::new(),
+        }
+    }
+    /// Whether the state's fluid is a source (water/lava level 0, waterlogged).
+    pub fn source_fluid(&self, state: BlockStateId) -> bool {
+        self.sources.contains(&state)
+    }
+    pub fn jigsaw_horizontal(&self, state: BlockStateId) -> Option<bool> {
+        self.jigsaw_states.get(&state).copied()
+    }
+    pub fn processor_list(
+        &self,
+        json: &str,
+        bindings: &super::block_feature::FeatureBlockBindings<'_>,
+    ) -> Result<ProcessorList, super::DecodeError> {
+        ProcessorList::decode(json, self, bindings)
+    }
+    pub fn is_jigsaw(&self, state: BlockStateId) -> bool {
+        self.jigsaw_states.contains_key(&state)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::template_path;
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn template_paths_stay_inside_the_template_root() {
+        let root = Path::new("/templates");
+        assert_eq!(
+            template_path(root, "minecraft:shipwreck/with_mast"),
+            Some(PathBuf::from(
+                "/templates/minecraft/shipwreck/with_mast.nbt"
+            )),
+            "a valid nested path stays"
+        );
+        assert_eq!(
+            template_path(root, "modid:path/to/nested/template"),
+            Some(PathBuf::from(
+                "/templates/modid/path/to/nested/template.nbt"
+            ))
+        );
+        for escape in [
+            "minecraft:../secret",
+            "minecraft:a/../../secret",
+            "minecraft:/etc/passwd",
+            "../templates/secret",
+            "minecraft:sub/../../../secret",
+        ] {
+            assert_eq!(template_path(root, escape), None, "{escape} escapes");
+        }
+    }
+}

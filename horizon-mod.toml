@@ -1,0 +1,45 @@
+id = "herobot"
+name = "HeroBot"
+version = "1.0.0"
+description = """Server-side framework for player bots that can fight, plus a block-based
+AI editor. Upstream: HerobaneNair/HeRoBot (Modrinth herobot, 1.78M
+downloads), license CC-BY-NC-SA-4.0 (upstream LICENSE shipped in the
+package).
+
+## What ships today
+
+The AI script engine, compiled and tested on the pinned SDK: the 21-rule
+settings table (registered as mod settings below), the AI script model,
+the block-def and block registries, the bool/string/vector/number
+expression evaluators, the sensor table, the hex (deflate+hex framing)
+and JSON script codecs. The bot framework itself (BotPlayer, pathing,
+the /herobot command) waits on the fake-player API gap below and lands
+behind it.
+
+## Horizon feature gaps, tracked on horizon-rust/horizon
+
+1. Server-side fake players. HeroBot's core is spawning and driving
+   player entities with near-client parity: auto-jump, spear, knockback
+   scaled by per-bot ping. Horizon's server mod API, hooks 8-15, has
+   commands, menus, block entities, particles and movement guards but
+   no way to spawn, tick or animate a fake player entity. Needed: a
+   native hook to create and despawn a player entity owned by a mod,
+   tick callbacks for it, and a way to apply movement and input to it.
+
+Pinned to Horizon f00125f61f794aaa3d4e950d301f353b35b6ee3d, horizon-mixins
+e59da9094f0c2fdda6c627fe9eff22dec6a906f0 and mod API 0.2; exact 1:1 Rust
+port tested against those revisions.
+
+Licence: CC-BY-NC-SA-4.0 (upstream, carried). Upstream:
+https://modrinth.com/mod/herobot (HerobaneNair/HeRoBot).
+Source: https://github.com/Sparticle62ops/horizon-herobot
+"""
+authors = ["sparticle", "HerobaneNair"]
+api = "0.2"
+side = "both"
+capabilities = ["registries"]
+
+[native]
+game = "26.3"
+horizon = "f00125f61f794aaa3d4e950d301f353b35b6ee3d"
+mixins = "e59da9094f0c2fdda6c627fe9eff22dec6a906f0"

@@ -2,7 +2,7 @@
 
 Server-side framework for player bots that can fight, plus a block-based
 AI editor. Upstream: HerobaneNair/HeRoBot (Modrinth herobot, 1.78M
-downloads), license CC-BY-NC-4.0 (LICENSE.txt copied verbatim).
+downloads), license CC-BY-NC-SA-4.0 (LICENSE.txt copied verbatim).
 
 ## Upstream layout
 
@@ -17,8 +17,15 @@ downloads), license CC-BY-NC-4.0 (LICENSE.txt copied verbatim).
 
 ## Port status
 
-- settings.rs: HeroBotSettings + Rule registry ported 1:1, same names,
-  defaults, bounds and descriptions, ordered as upstream. The /herobot
+- The 1:1 logic is compiled as one crate on the pinned SDK
+  (Horizon f00125f61f79, mixins e59da9094f0c, mod API 0.2): src/lib.rs
+  declares the twelve modules and wires the original's 21-entry @Rule
+  table (`settings::RULES`) as Horizon mod settings, same names,
+  defaults, bounds and descriptions, ordered as upstream. Unbounded
+  upstream rules get a display cap on their slider (noted in lib.rs);
+  the rule's own bound stays the min. Labels and tooltips ship in
+  assets/herobot/lang/en_us.json.
+- settings.rs: HeroBotSettings + Rule registry ported 1:1. The /herobot
   command wiring lands with the server command module.
 - ai.rs: the AI script model ported and rustc-clean: VarType,
   VarDecl, FuncDecl, Comment with per-char style flags, Wire,
@@ -41,12 +48,11 @@ downloads), license CC-BY-NC-4.0 (LICENSE.txt copied verbatim).
    overrides, shield stun windows, damage-tick overrides, so the
    settings above actually bind.
 
-Issue text drafted. Filing is blocked until the GitHub token is
-renewed: push and the gh API both fail on the expired one.
+Both gaps are filed on horizon-rust/horizon and linked from the PR.
 
 ## License
 
-CC-BY-NC-4.0: this port is a derivative for non-commercial use with
+CC-BY-NC-SA-4.0: this port is a derivative for non-commercial use with
 attribution. NOT listable in the horizon-mods registry without Danil's
 grant decision, since registry policy only auto-lists MIT, BSD, Apache,
 ISC, zlib, Unlicense and CC0. Listing is Danil's call.
